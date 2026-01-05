@@ -3,11 +3,14 @@ import { requireApiKey } from "./_auth.js";
 import { getSheetsClient } from "./_sheets.js";
 
 const QuerySchema = z.object({
-  // Allow either a number or the string "all"
+  // Fetch all rows in pages:
+  offset: z.coerce.number().int().min(0).default(0),
+  pageSize: z.coerce.number().int().min(1).max(200).default(100),
+
+  // Optional: keep old behavior (latest N rows) if you still want it sometimes
   limit: z
     .union([z.literal("all"), z.coerce.number().int().min(1).max(10000)])
-    .optional()
-    .default("all"),
+    .optional(),
 });
 
 export default async function handler(req, res) {
@@ -18,9 +21,10 @@ export default async function handler(req, res) {
   const authCheck = requireApiKey(req);
   if (!authCheck.ok) return res.status(authCheck.status).json(authCheck.body);
 
-  // Parse limit
   const parsed = QuerySchema.safeParse(req.query);
-  const limitParam = parsed.success ? parsed.data.limit : "all";
+  const { offset, pageSize, limit } = parsed.success
+    ? parsed.data
+    : { offset: 0, pageSize: 100, limit: undefined };
 
   const sheets = getSheetsClient();
   const spreadsheetId = process.env.SPREADSHEET_ID;
@@ -32,12 +36,31 @@ export default async function handler(req, res) {
   });
 
   const rows = read.data.values || [];
+  const totalRows = rows.length;
 
-  // If limit=all -> return all rows, else last N rows
-  const resultRows =
-    limitParam === "all" ? rows : rows.slice(-Number(limitParam));
+  // Mode A: latest N rows (backwards compatible)
+  if (typeof limit === "number") {
+    const latest = rows.slice(-limit);
+    return res.status(200).json({
+      ok: true,
+      mode: "latest",
+      rows: latest,
+      totalRows,
+    });
+  }
 
-  return res
-    .status(200)
-    .json({ ok: true, rows: resultRows, totalRows: rows.length });
+  // Mode B: paginated "all rows"
+  const slice = rows.slice(offset, offset + pageSize);
+  const nextOffset = offset + pageSize < totalRows ? offset + pageSize : null;
+
+  return res.status(200).json({
+    ok: true,
+    mode: "paged",
+    rows: slice,
+    totalRows,
+    offset,
+    pageSize,
+    nextOffset,
+    hasMore: nextOffset !== null,
+  });
 }
